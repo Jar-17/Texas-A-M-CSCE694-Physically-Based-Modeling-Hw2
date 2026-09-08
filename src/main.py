@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 import pygame
 
-# include the physics and settings modules
+"""include the physics and settings modules"""
 try:
     from physics.world import BallState, PhysicsWorld, SimulationConfig
     from ui.settings import AppSettings
@@ -176,6 +176,10 @@ def main() -> int:
                     settings.friction = float(np.clip(settings.friction + 0.05, 0.0, 1.0))
                 elif event.key == pygame.K_g:
                     settings.friction = float(np.clip(settings.friction - 0.05, 0.0, 1.0))
+                elif event.key == pygame.K_h:
+                    settings.drag_coefficient = float(np.clip(settings.drag_coefficient + 0.05, 0.0, 1.0))
+                elif event.key == pygame.K_j:
+                    settings.drag_coefficient = float(np.clip(settings.drag_coefficient - 0.05, 0.0, 1.0))
                 elif event.key == pygame.K_c:
                     camera.reset()
 
@@ -206,7 +210,7 @@ def main() -> int:
             f"g {settings.gravity:.2f}   wind x {settings.wind_x:+.2f}   drag {settings.drag_coefficient:.3f}",
             f"restitution {settings.restitution:.2f}   friction {settings.friction:.2f}   dt {settings.fixed_dt:.4f}s",
             f"{'PAUSED' if paused else 'RUNNING'}   |   1-4 presets   R reset   SPACE pause   UP/DOWN dt",
-            "LEFT/RIGHT wind   F/G friction   ESC quit",
+            "LEFT/RIGHT wind   F/G friction   H/J drag   ESC quit",
             f"A/D orbit   W/S tilt   Q/E zoom   C reset view   dist {camera.distance:.2f}",
         ]
         for i, line in enumerate(info):
