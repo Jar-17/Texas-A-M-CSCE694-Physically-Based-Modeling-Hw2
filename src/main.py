@@ -31,6 +31,9 @@ ORIGIN = np.array([0.0, 0.0, 0.0])
 DEFAULT_CAMERA_POSITION = np.array([4.5, 3.2, 6.0], dtype=float)
 MAX_FRAME_DT = 0.25
 MAX_PHYSICS_STEPS_PER_FRAME = 8
+BALL_RADIUS = 0.06
+MIN_BALL_COUNT = 1
+MAX_BALL_COUNT = 12
 
 
 @dataclass
@@ -129,11 +132,31 @@ def reset_ball(ball: BallState, position, velocity) -> None:
     ball.sleep_time = 0.0
 
 
-def reset_balls(balls: list[BallState], position, velocity) -> None:
-    offsets = ((0.0, 0.0, 0.0), (0.22, 0.08, 0.0), (-0.22, 0.08, 0.08))
-    velocity_offsets = ((0.0, 0.0, 0.0), (-0.4, 0.0, 0.2), (0.4, 0.0, -0.2))
-    for ball, offset, velocity_offset in zip(balls, offsets, velocity_offsets):
-        reset_ball(ball, np.asarray(position) + offset, np.asarray(velocity) + velocity_offset)
+def random_positions(count: int, bounds_min: np.ndarray, bounds_max: np.ndarray, radius: float, rng) -> list[np.ndarray]:
+    positions = []
+    minimum = bounds_min + radius
+    maximum = bounds_max - radius
+    for _ in range(count):
+        for _ in range(1000):
+            candidate = rng.uniform(minimum, maximum)
+            if all(np.linalg.norm(candidate - existing) >= 2.0 * radius for existing in positions):
+                positions.append(candidate)
+                break
+        else:
+            raise RuntimeError("Unable to place all balls without overlap")
+    return positions
+
+
+def create_balls(count: int, velocity, bounds_min: np.ndarray, bounds_max: np.ndarray, rng) -> list[BallState]:
+    return [
+        BallState(position=position, velocity=np.array(velocity, dtype=float))
+        for position in random_positions(count, bounds_min, bounds_max, BALL_RADIUS, rng)
+    ]
+
+
+def reset_balls(balls: list[BallState], velocity, bounds_min: np.ndarray, bounds_max: np.ndarray, rng) -> None:
+    for ball, position in zip(balls, random_positions(len(balls), bounds_min, bounds_max, BALL_RADIUS, rng)):
+        reset_ball(ball, position, velocity)
 
 
 @dataclass
@@ -194,7 +217,7 @@ def draw_panel(
     for slider in sliders:
         slider.draw(screen, font, small_font)
 
-    button_y = 558
+    button_y = 520
     buttons = (
         (pygame.Rect(22, button_y, 122, 38), "RESET BALL"),
         (pygame.Rect(154, button_y, 122, 38), "RESET VIEW"),
@@ -204,9 +227,9 @@ def draw_panel(
         draw_button(screen, small_font, rect, label, rect.collidepoint(mouse_position))
 
     launch_label = small_font.render("Launch presets", True, MUTED_TEXT)
-    screen.blit(launch_label, (WIDTH - launch_label.get_width() - 22, 628))
+    screen.blit(launch_label, (WIDTH - launch_label.get_width() - 22, 625))
     for index, label in enumerate(("SIDE", "FLOOR", "TOP", "CORNER")):
-        rect = pygame.Rect(22 + index * 64, 651, 56, 32)
+        rect = pygame.Rect(22 + index * 64, 648, 56, 32)
         draw_button(screen, small_font, rect, label, rect.collidepoint(mouse_position))
     keyboard_label = small_font.render("Keyboard: A/D orbit  W/S tilt  Q/E zoom  ESC quit", True, MUTED_TEXT)
     screen.blit(keyboard_label, (WIDTH - keyboard_label.get_width() - 22, 710))
@@ -222,12 +245,13 @@ def main() -> int:
     settings = AppSettings()
     sliders = [
         Slider("Gravity", 0.0, 20.0, settings.gravity, pygame.Rect(22, 100, 254, 10)),
-        Slider("Wind X", -10.0, 10.0, settings.wind_x, pygame.Rect(22, 165, 254, 10)),
-        Slider("Wind Y", -10.0, 10.0, settings.wind_y, pygame.Rect(22, 230, 254, 10)),
-        Slider("Air drag", 0.0, 1.0, settings.drag_coefficient, pygame.Rect(22, 295, 254, 10)),
-        Slider("Restitution", 0.0, 1.0, settings.restitution, pygame.Rect(22, 360, 254, 10)),
-        Slider("Friction", 0.0, 1.0, settings.friction, pygame.Rect(22, 425, 254, 10)),
-        Slider("Physics dt", 1.0 / 240.0, 1.0 / 20.0, settings.fixed_dt, pygame.Rect(22, 490, 254, 10), 4),
+        Slider("Wind X", -10.0, 10.0, settings.wind_x, pygame.Rect(22, 150, 254, 10)),
+        Slider("Wind Y", -10.0, 10.0, settings.wind_y, pygame.Rect(22, 200, 254, 10)),
+        Slider("Air drag", 0.0, 1.0, settings.drag_coefficient, pygame.Rect(22, 250, 254, 10)),
+        Slider("Restitution", 0.0, 1.0, settings.restitution, pygame.Rect(22, 300, 254, 10)),
+        Slider("Friction", 0.0, 1.0, settings.friction, pygame.Rect(22, 350, 254, 10)),
+        Slider("Ball count", MIN_BALL_COUNT, MAX_BALL_COUNT, 3, pygame.Rect(22, 400, 254, 10), 0),
+        Slider("Physics dt", 1.0 / 240.0, 1.0 / 20.0, settings.fixed_dt, pygame.Rect(22, 450, 254, 10), 4),
     ]
     camera = Camera(
         position=np.array([4.5, 3.2, 6.0], dtype=float),
@@ -240,11 +264,10 @@ def main() -> int:
         pygame.K_4: ([0.0, 0.0, 0.0], [3.0, 4.5, 2.5]),
     }
     initial_position, initial_velocity = presets[pygame.K_1]
-    balls = [
-        BallState(position=np.array(initial_position, dtype=float), velocity=np.array(initial_velocity, dtype=float)),
-        BallState(position=np.array(initial_position, dtype=float) + [0.22, 0.08, 0.0], velocity=np.array(initial_velocity, dtype=float) + [-0.4, 0.0, 0.2]),
-        BallState(position=np.array(initial_position, dtype=float) + [-0.22, 0.08, 0.08], velocity=np.array(initial_velocity, dtype=float) + [0.4, 0.0, -0.2]),
-    ]
+    bounds_min = np.array([-1.5, -1.0, -1.2], dtype=float)
+    bounds_max = np.array([1.5, 1.0, 1.2], dtype=float)
+    rng = np.random.default_rng()
+    balls = create_balls(3, initial_velocity, bounds_min, bounds_max, rng)
     ball = balls[0]
     world = PhysicsWorld(
         ball=ball,
@@ -257,8 +280,8 @@ def main() -> int:
             friction=settings.friction,
             time_step=settings.fixed_dt,
         ),
-        bounds_min=[-1.5, -1.0, -1.2],
-        bounds_max=[1.5, 1.0, 1.2],
+        bounds_min=bounds_min,
+        bounds_max=bounds_max,
     )
 
     accumulator = 0.0
@@ -277,31 +300,31 @@ def main() -> int:
                 running = False
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 mouse_position = event.pos
-                reset_button = pygame.Rect(22, 558, 122, 38)
-                view_button = pygame.Rect(154, 558, 122, 38)
-                pause_button = pygame.Rect(22, 606, 254, 40)
+                reset_button = pygame.Rect(22, 520, 122, 38)
+                view_button = pygame.Rect(154, 520, 122, 38)
+                pause_button = pygame.Rect(22, 568, 254, 40)
                 if reset_button.collidepoint(mouse_position):
-                    reset_balls(balls, initial_position, initial_velocity)
+                    reset_balls(balls, initial_velocity, bounds_min, bounds_max, rng)
                 elif view_button.collidepoint(mouse_position):
                     camera.reset()
                 elif pause_button.collidepoint(mouse_position):
                     paused = not paused
                 else:
                     for index in range(4):
-                        preset_button = pygame.Rect(22 + index * 64, 651, 56, 32)
+                        preset_button = pygame.Rect(22 + index * 64, 648, 56, 32)
                         if preset_button.collidepoint(mouse_position):
                             preset_key = (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4)[index]
                             initial_position, initial_velocity = presets[preset_key]
-                            reset_balls(balls, initial_position, initial_velocity)
+                            reset_balls(balls, initial_velocity, bounds_min, bounds_max, rng)
                             break
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False
                 elif event.key == pygame.K_r:
-                    reset_balls(balls, initial_position, initial_velocity)
+                    reset_balls(balls, initial_velocity, bounds_min, bounds_max, rng)
                 elif event.key in presets:
                     initial_position, initial_velocity = presets[event.key]
-                    reset_balls(balls, initial_position, initial_velocity)
+                    reset_balls(balls, initial_velocity, bounds_min, bounds_max, rng)
                 elif event.key == pygame.K_SPACE:
                     paused = not paused
                 elif event.key in (pygame.K_LEFT, pygame.K_RIGHT):
@@ -309,7 +332,7 @@ def main() -> int:
                     sliders[1].value = settings.wind_x
                 elif event.key in (pygame.K_UP, pygame.K_DOWN):
                     settings.fixed_dt = float(np.clip(settings.fixed_dt + (-1 if event.key == pygame.K_UP else 1) / 240.0, 1.0 / 240.0, 1.0 / 20.0))
-                    sliders[6].value = settings.fixed_dt
+                    sliders[7].value = settings.fixed_dt
                     # Discard time accumulated using the previous timestep.
                     accumulator = 0.0
                 elif event.key == pygame.K_f:
@@ -333,8 +356,13 @@ def main() -> int:
         settings.drag_coefficient = sliders[3].value
         settings.restitution = sliders[4].value
         settings.friction = sliders[5].value
-        if settings.fixed_dt != sliders[6].value:
-            settings.fixed_dt = sliders[6].value
+        desired_ball_count = int(round(sliders[6].value))
+        if desired_ball_count != len(balls):
+            balls = create_balls(desired_ball_count, initial_velocity, bounds_min, bounds_max, rng)
+            world.balls = balls
+            world.ball = balls[0]
+        if settings.fixed_dt != sliders[7].value:
+            settings.fixed_dt = sliders[7].value
             # Leftover time was measured using a different timestep.
             accumulator = 0.0
 

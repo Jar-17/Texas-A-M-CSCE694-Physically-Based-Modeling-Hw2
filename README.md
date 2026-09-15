@@ -9,7 +9,7 @@ python src/main.py
 ```
 
 ## Controls
-- Use the left-side control panel sliders to adjust gravity, x/y wind, air drag, restitution, friction, and physics timestep while the simulation runs.
+- Use the left-side control panel sliders to adjust gravity, x/y wind, air drag, restitution, friction, ball count, and physics timestep while the simulation runs.
 - Use the panel buttons to reset the ball, reset the camera, pause/resume, or select a launch preset.
 - `1`-`4` select repeatable launch cases (side, floor, top, and corner motion)
 - `R` reset the current case
@@ -25,6 +25,7 @@ python src/main.py
 - The simulation uses explicit Euler integration for position and velocity.
 - Every step performs a swept sphere-vs-box test for each ball. If a face is reached before the end of the step, the step is split at that fractional contact time, collision response is applied, and the remaining time is integrated.
 - The default scene contains three balls. Overlapping balls are separated and resolved with a mass-aware restitution impulse.
+- Ball positions are randomized on startup and reset, with a minimum separation to prevent initial overlaps.
 - Forces include gravity, constant wind, and velocity-dependent air drag. Collision response includes restitution and tangential friction.
 - The container is a full 3D box with six faces. The display is a projected wireframe view so motion in x, y, and z can be observed.
 - The render timer runs at 60 FPS independently of the adjustable physics step size. The on-screen `dt` value makes the integration setting visible during a demonstration.
