@@ -13,12 +13,20 @@ except ModuleNotFoundError:
     from src.physics.world import BallState, PhysicsWorld, SimulationConfig
     from src.ui.settings import AppSettings
 
-WIDTH = 900
-HEIGHT = 700
+WIDTH = 1200
+HEIGHT = 760
+PANEL_WIDTH = 300
+VIEWPORT = (PANEL_WIDTH, 0, WIDTH - PANEL_WIDTH, HEIGHT)
 BG = (13, 18, 24)
 BALL_COLOR = (255, 195, 80)
 BOX_COLOR = (105, 150, 180)
 BOX_FILL = (24, 44, 56)
+PANEL_BG = (22, 28, 36)
+PANEL_BORDER = (53, 68, 82)
+TEXT = (235, 241, 245)
+MUTED_TEXT = (148, 164, 176)
+ACCENT = (78, 186, 170)
+ACCENT_HOVER = (102, 210, 191)
 ORIGIN = np.array([0.0, 0.0, 0.0])
 DEFAULT_CAMERA_POSITION = np.array([4.5, 3.2, 6.0], dtype=float)
 
@@ -53,9 +61,10 @@ class Camera:
         if depth <= self.near_clip:
             return None
 
-        focal_length = (HEIGHT * 0.5) / np.tan(np.deg2rad(self.field_of_view) * 0.5)
-        screen_x = WIDTH * 0.5 + focal_length * camera_x / depth
-        screen_y = HEIGHT * 0.5 - focal_length * camera_y / depth
+        viewport_x, viewport_y, viewport_width, viewport_height = VIEWPORT
+        focal_length = (viewport_height * 0.5) / np.tan(np.deg2rad(self.field_of_view) * 0.5)
+        screen_x = viewport_x + viewport_width * 0.5 + focal_length * camera_x / depth
+        screen_y = viewport_y + viewport_height * 0.5 - focal_length * camera_y / depth
         return (int(screen_x), int(screen_y)), depth
 
     def orbit(self, yaw: float, pitch: float) -> None:
@@ -105,7 +114,8 @@ def draw_ball(screen: pygame.Surface, camera: Camera, ball: BallState) -> None:
     if projected is None:
         return
     (x, y), depth = projected
-    focal_length = (HEIGHT * 0.5) / np.tan(np.deg2rad(camera.field_of_view) * 0.5)
+    _, _, _, viewport_height = VIEWPORT
+    focal_length = (viewport_height * 0.5) / np.tan(np.deg2rad(camera.field_of_view) * 0.5)
     radius = max(2, int(ball.radius * focal_length / depth))
     pygame.draw.circle(screen, BALL_COLOR, (x, y), radius)
 
@@ -113,15 +123,101 @@ def draw_ball(screen: pygame.Surface, camera: Camera, ball: BallState) -> None:
 def reset_ball(ball: BallState, position, velocity) -> None:
     ball.position = np.array(position, dtype=float)
     ball.velocity = np.array(velocity, dtype=float)
+    ball.asleep = False
+    ball.sleep_time = 0.0
+
+
+@dataclass
+class Slider:
+    label: str
+    minimum: float
+    maximum: float
+    value: float
+    rect: pygame.Rect
+    decimals: int = 2
+    dragging: bool = False
+
+    def _set_from_mouse(self, mouse_x: int) -> None:
+        ratio = np.clip((mouse_x - self.rect.left) / self.rect.width, 0.0, 1.0)
+        self.value = self.minimum + float(ratio) * (self.maximum - self.minimum)
+
+    def handle_event(self, event: pygame.event.Event) -> None:
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self.rect.collidepoint(event.pos):
+            self.dragging = True
+            self._set_from_mouse(event.pos[0])
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self.dragging = False
+        elif event.type == pygame.MOUSEMOTION and self.dragging:
+            self._set_from_mouse(event.pos[0])
+
+    def draw(self, screen: pygame.Surface, font: pygame.font.Font, small_font: pygame.font.Font) -> None:
+        screen.blit(font.render(self.label, True, TEXT), (self.rect.left, self.rect.top - 25))
+        value_text = f"{self.value:.{self.decimals}f}"
+        value_surface = small_font.render(value_text, True, ACCENT_HOVER)
+        screen.blit(value_surface, (self.rect.right - value_surface.get_width(), self.rect.top - 24))
+        pygame.draw.rect(screen, (48, 61, 72), self.rect, border_radius=3)
+        ratio = (self.value - self.minimum) / (self.maximum - self.minimum)
+        fill_width = max(8, int(self.rect.width * ratio))
+        pygame.draw.rect(screen, ACCENT, (self.rect.left, self.rect.top, fill_width, self.rect.height), border_radius=3)
+        knob_x = self.rect.left + int(self.rect.width * ratio)
+        pygame.draw.circle(screen, TEXT, (knob_x, self.rect.centery), 7)
+
+
+def draw_button(screen: pygame.Surface, font: pygame.font.Font, rect: pygame.Rect, label: str, hovered: bool) -> None:
+    color = ACCENT_HOVER if hovered else (39, 93, 94)
+    pygame.draw.rect(screen, color, rect, border_radius=5)
+    text_surface = font.render(label, True, (8, 24, 28))
+    screen.blit(text_surface, text_surface.get_rect(center=rect.center))
+
+
+def draw_panel(
+    screen: pygame.Surface,
+    font: pygame.font.Font,
+    small_font: pygame.font.Font,
+    sliders: list[Slider],
+    paused: bool,
+    mouse_position: tuple[int, int],
+) -> None:
+    pygame.draw.rect(screen, PANEL_BG, (0, 0, PANEL_WIDTH, HEIGHT))
+    pygame.draw.line(screen, PANEL_BORDER, (PANEL_WIDTH - 1, 0), (PANEL_WIDTH - 1, HEIGHT), 2)
+    screen.blit(font.render("SIMULATION CONTROLS", True, TEXT), (22, 20))
+    screen.blit(small_font.render("Adjust parameters while it runs", True, MUTED_TEXT), (22, 49))
+    for slider in sliders:
+        slider.draw(screen, font, small_font)
+
+    button_y = 558
+    buttons = (
+        (pygame.Rect(22, button_y, 122, 38), "RESET BALL"),
+        (pygame.Rect(154, button_y, 122, 38), "RESET VIEW"),
+        (pygame.Rect(22, button_y + 48, 254, 40), "RESUME" if paused else "PAUSE"),
+    )
+    for rect, label in buttons:
+        draw_button(screen, small_font, rect, label, rect.collidepoint(mouse_position))
+
+    screen.blit(small_font.render("Launch presets", True, MUTED_TEXT), (22, 628))
+    for index, label in enumerate(("SIDE", "FLOOR", "TOP", "CORNER")):
+        rect = pygame.Rect(22 + index * 64, 651, 56, 32)
+        draw_button(screen, small_font, rect, label, rect.collidepoint(mouse_position))
+    screen.blit(small_font.render("Keyboard: A/D orbit  W/S tilt  Q/E zoom  ESC quit", True, MUTED_TEXT), (22, 710))
 
 
 def main() -> int:
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     clock = pygame.time.Clock()
-    font = pygame.font.SysFont(None, 24)
+    font = pygame.font.SysFont("segoeui", 20)
+    small_font = pygame.font.SysFont("segoeui", 16)
 
     settings = AppSettings()
+    sliders = [
+        Slider("Gravity", 0.0, 20.0, settings.gravity, pygame.Rect(22, 100, 254, 10)),
+        Slider("Wind X", -10.0, 10.0, settings.wind_x, pygame.Rect(22, 165, 254, 10)),
+        Slider("Wind Y", -10.0, 10.0, settings.wind_y, pygame.Rect(22, 230, 254, 10)),
+        Slider("Air drag", 0.0, 1.0, settings.drag_coefficient, pygame.Rect(22, 295, 254, 10)),
+        Slider("Restitution", 0.0, 1.0, settings.restitution, pygame.Rect(22, 360, 254, 10)),
+        Slider("Friction", 0.0, 1.0, settings.friction, pygame.Rect(22, 425, 254, 10)),
+        Slider("Physics dt", 1.0 / 240.0, 1.0 / 20.0, settings.fixed_dt, pygame.Rect(22, 490, 254, 10), 4),
+    ]
     camera = Camera(
         position=np.array([4.5, 3.2, 6.0], dtype=float),
         target=ORIGIN.copy(),
@@ -156,8 +252,29 @@ def main() -> int:
         accumulator += frame_dt
 
         for event in pygame.event.get():
+            for slider in sliders:
+                slider.handle_event(event)
             if event.type == pygame.QUIT:
                 running = False
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                mouse_position = event.pos
+                reset_button = pygame.Rect(22, 558, 122, 38)
+                view_button = pygame.Rect(154, 558, 122, 38)
+                pause_button = pygame.Rect(22, 606, 254, 40)
+                if reset_button.collidepoint(mouse_position):
+                    reset_ball(ball, initial_position, initial_velocity)
+                elif view_button.collidepoint(mouse_position):
+                    camera.reset()
+                elif pause_button.collidepoint(mouse_position):
+                    paused = not paused
+                else:
+                    for index in range(4):
+                        preset_button = pygame.Rect(22 + index * 64, 651, 56, 32)
+                        if preset_button.collidepoint(mouse_position):
+                            preset_key = (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4)[index]
+                            initial_position, initial_velocity = presets[preset_key]
+                            reset_ball(ball, initial_position, initial_velocity)
+                            break
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False
@@ -170,18 +287,34 @@ def main() -> int:
                     paused = not paused
                 elif event.key in (pygame.K_LEFT, pygame.K_RIGHT):
                     settings.wind_x += -0.5 if event.key == pygame.K_LEFT else 0.5
+                    sliders[1].value = settings.wind_x
                 elif event.key in (pygame.K_UP, pygame.K_DOWN):
                     settings.fixed_dt = float(np.clip(settings.fixed_dt + (-1 if event.key == pygame.K_UP else 1) / 240.0, 1.0 / 240.0, 1.0 / 20.0))
+                    sliders[6].value = settings.fixed_dt
+                    # Discard time accumulated using the previous timestep.
+                    accumulator = 0.0
                 elif event.key == pygame.K_f:
                     settings.friction = float(np.clip(settings.friction + 0.05, 0.0, 1.0))
+                    sliders[5].value = settings.friction
                 elif event.key == pygame.K_g:
                     settings.friction = float(np.clip(settings.friction - 0.05, 0.0, 1.0))
+                    sliders[5].value = settings.friction
                 elif event.key == pygame.K_h:
                     settings.drag_coefficient = float(np.clip(settings.drag_coefficient + 0.05, 0.0, 1.0))
+                    sliders[3].value = settings.drag_coefficient
                 elif event.key == pygame.K_j:
                     settings.drag_coefficient = float(np.clip(settings.drag_coefficient - 0.05, 0.0, 1.0))
+                    sliders[3].value = settings.drag_coefficient
                 elif event.key == pygame.K_c:
                     camera.reset()
+
+        settings.gravity = sliders[0].value
+        settings.wind_x = sliders[1].value
+        settings.wind_y = sliders[2].value
+        settings.drag_coefficient = sliders[3].value
+        settings.restitution = sliders[4].value
+        settings.friction = sliders[5].value
+        settings.fixed_dt = sliders[6].value
 
         camera_keys = pygame.key.get_pressed()
         camera.orbit(
@@ -205,17 +338,10 @@ def main() -> int:
         screen.fill(BG)
         draw_box(screen, camera, world.bounds_min, world.bounds_max)
         draw_ball(screen, camera, ball)
-
-        info = [
-            f"g {settings.gravity:.2f}   wind x {settings.wind_x:+.2f}   drag {settings.drag_coefficient:.3f}",
-            f"restitution {settings.restitution:.2f}   friction {settings.friction:.2f}   dt {settings.fixed_dt:.4f}s",
-            f"{'PAUSED' if paused else 'RUNNING'}   |   1-4 presets   R reset   SPACE pause   UP/DOWN dt",
-            "LEFT/RIGHT wind   F/G friction   H/J drag   ESC quit",
-            f"A/D orbit   W/S tilt   Q/E zoom   C reset view   dist {camera.distance:.2f}",
-        ]
-        for i, line in enumerate(info):
-            surf = font.render(line, True, (240, 240, 240))
-            screen.blit(surf, (16, 12 + i * 22))
+        mouse_position = pygame.mouse.get_pos()
+        draw_panel(screen, font, small_font, sliders, paused, mouse_position)
+        status = f"{'PAUSED' if paused else 'RUNNING'}   |   camera distance {camera.distance:.2f}   |   SPACE pause"
+        screen.blit(font.render(status, True, TEXT), (PANEL_WIDTH + 22, 20))
 
         pygame.display.flip()
 

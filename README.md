@@ -9,12 +9,16 @@ python src/main.py
 ```
 
 ## Controls
+- Use the left-side control panel sliders to adjust gravity, x/y wind, air drag, restitution, friction, and physics timestep while the simulation runs.
+- Use the panel buttons to reset the ball, reset the camera, pause/resume, or select a launch preset.
 - `1`-`4` select repeatable launch cases (side, floor, top, and corner motion)
 - `R` reset the current case
 - `SPACE` pause/resume
 - `UP`/`DOWN` decrease/increase the Euler integration step size
 - `LEFT`/`RIGHT` adjust the x-direction wind force
 - `F`/`G` increase/decrease collision friction
+- `H`/`J` increase/decrease air drag
+- `A`/`D` orbit, `W`/`S` tilt, `Q`/`E` zoom, `C` reset the camera
 - `ESC` quit
 
 ## Implementation notes
@@ -30,4 +34,4 @@ python src/main.py
 3. Change `dt` with `UP`/`DOWN` while the animation continues at the same display rate.
 4. Increase friction with `F` and wind with `LEFT`/`RIGHT`; pause with `SPACE` to point out the current state.
 
-The simulation logic is in `src/physics/world.py`; the Pygame rendering and user interface are in `src/main.py`.
+The simulation logic is in `src/physics/world.py`; the Pygame rendering, control panel, and user interface are in `src/main.py`.
