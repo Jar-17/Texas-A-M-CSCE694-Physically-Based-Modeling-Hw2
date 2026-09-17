@@ -333,8 +333,6 @@ def main() -> int:
                 elif event.key in (pygame.K_UP, pygame.K_DOWN):
                     settings.fixed_dt = float(np.clip(settings.fixed_dt + (-1 if event.key == pygame.K_UP else 1) / 240.0, 1.0 / 240.0, 1.0 / 20.0))
                     sliders[7].value = settings.fixed_dt
-                    # Discard time accumulated using the previous timestep.
-                    accumulator = 0.0
                 elif event.key == pygame.K_f:
                     settings.friction = float(np.clip(settings.friction + 0.05, 0.0, 1.0))
                     sliders[5].value = settings.friction
@@ -363,8 +361,6 @@ def main() -> int:
             world.ball = balls[0]
         if settings.fixed_dt != sliders[7].value:
             settings.fixed_dt = sliders[7].value
-            # Leftover time was measured using a different timestep.
-            accumulator = 0.0
 
         camera_keys = pygame.key.get_pressed()
         camera.orbit(
