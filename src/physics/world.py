@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
+
+try:
+    from physics.ply_loader import PointCloudMesh, GRID_CELL_SIZE
+    from physics.gpu import gpu_available, get_array_module, to_device, to_numpy
+except ModuleNotFoundError:
+    from src.physics.ply_loader import PointCloudMesh, GRID_CELL_SIZE
+    from src.physics.gpu import get_array_module, to_device, to_numpy
 
 # Time tolerance is relative to the current timestep, with a small absolute floor.
 TIME_EPSILON_RELATIVE = 1.0e-4
@@ -17,12 +25,46 @@ CONTACT_VELOCITY_EPSILON = 1.0e-9
 REST_VELOCITY_EPSILON = 1.0e-4
 
 
-@dataclass
 class BallState:
-    position: np.ndarray
-    velocity: np.ndarray
-    mass: float = 1.0
-    radius: float = 0.06
+    def __init__(self, position=None, velocity=None, mass=1.0, radius=0.06):
+        self.position = np.asarray(position, dtype=float).reshape((-1, 3)) if position is not None else np.empty((0, 3), dtype=float)
+        self.velocity = np.asarray(velocity, dtype=float).reshape((-1, 3)) if velocity is not None else np.empty((0, 3), dtype=float)
+        if self.position.shape != self.velocity.shape:
+            raise ValueError("position and velocity must have matching (N, 3) shapes")
+        self.mass = float(mass)
+        self.radius = float(radius)
+        self.lifespan = np.empty(self.count, dtype=float)
+        self.initial_lifespan = np.empty(self.count, dtype=float)
+        self.color = np.empty((self.count, 3), dtype=float)
+
+    @property
+    def count(self):
+        return self.position.shape[0]
+
+    def spawn_particles(self, count, origin=(0.0, 0.0, 0.0), rng=None):
+        """Particle generation function. Using uniform distribution for position and lifespan, and normal distribution for velocity."""
+        rng = np.random.default_rng() if rng is None else rng
+        count = max(0, int(count))
+        origin = np.asarray(origin, dtype=float)
+        self.position = origin + rng.uniform(-0.12, 0.12, size=(count, 3))
+        self.velocity = rng.normal(0.0, 1.0, size=(count, 3))
+        self.velocity[:, 1] = np.abs(self.velocity[:, 1]) * 2.5 + 2.0
+        self.velocity[:, (0, 2)] *= 1.5
+        self.initial_lifespan = rng.uniform(1.5, 10.0, size=count)
+        self.lifespan = self.initial_lifespan.copy()
+        self.color = np.column_stack((
+            rng.uniform(0.85, 1.0, size=count),
+            rng.uniform(0.35, 0.85, size=count),
+            rng.uniform(0.05, 0.35, size=count),
+        ))
+
+    def filter_active(self, active):
+        """check life span and filter out dead particles"""
+        self.position = self.position[active]
+        self.velocity = self.velocity[active]
+        self.lifespan = self.lifespan[active]
+        self.initial_lifespan = self.initial_lifespan[active]
+        self.color = self.color[active]
 
 
 @dataclass
@@ -33,172 +75,302 @@ class SimulationConfig:
     restitution: float
     friction: float
     time_step: float
+    """for tornado and explosion effect"""
+    vortex_strength: float = 1.5
+    vortex_enabled: bool = False
+    explosive_force_enabled: bool = False
+    explosive_force_strength: float = 4.0
 
 
 class PhysicsWorld:
     def __init__(self, ball: BallState, config: SimulationConfig, bounds_min, bounds_max, balls=None):
-        self.balls = list(balls) if balls is not None else [ball]
-        if not self.balls:
-            raise ValueError("PhysicsWorld requires at least one ball")
-        self.ball = self.balls[0]
+        self.ball = ball
+        self.balls = balls
         self.config = config
         self.bounds_min = np.array(bounds_min, dtype=float)
         self.bounds_max = np.array(bounds_max, dtype=float)
 
-    def compute_net_force(self, ball: BallState | None = None) -> np.ndarray:
-        ball = self.ball if ball is None else ball
-        gravity_force = ball.mass * self.config.gravity
-        wind_force = np.array(self.config.wind, dtype=float)
-        drag_force = -self.config.drag_coefficient * ball.velocity
-        return gravity_force + wind_force + drag_force
+        """polygon plane: 4 vertices, normal, and plane offset"""
+        self._poly_vertices_np = np.array([
+            [-1.0, 0.0, 0.25], [0.15, 0.55, 0.9], [1.0, 0.0, -0.25], [-0.15, -0.55, -0.9]
+        ], dtype=float)
+        edge_a = self._poly_vertices_np[1] - self._poly_vertices_np[0]
+        edge_b = self._poly_vertices_np[2] - self._poly_vertices_np[0]
+        self._poly_normal_np = np.cross(edge_a, edge_b)
+        self._poly_normal_np /= np.linalg.norm(self._poly_normal_np)
+        self._poly_plane_offset = float(np.dot(self._poly_normal_np, self._poly_vertices_np[0]))
+
+        """control polygon rendering and collision from the UI; flash timer is set to 0.15 seconds on collision"""
+        self.poly_flash_timer: float = 0.0
+        """remove polygon in simulation"""
+        self.poly_enabled: bool = True
+        """optional point cloud mesh"""
+        self.mesh: Optional[PointCloudMesh] = None
+
+        """when GPU mode turn on, create GPU copies of polygon data; set by _sync_constants_to_device()"""
+        self.gpu_enabled: bool = False
+        self.xp = np                  # active array module (numpy or cupy)
+        # Device copies of world constants (set by _sync_constants_to_device)
+        self._bounds_min_d = self.bounds_min
+        self._bounds_max_d = self.bounds_max
+        self.poly_vertices = self._poly_vertices_np
+        self.poly_normal   = self._poly_normal_np
+        self.poly_plane_offset = self._poly_plane_offset
+
+    """functions for GPU acceleration; enable_gpu() and disable_gpu() are called from the UI"""
+    def enable_gpu(self) -> bool:
+        """
+        Switch physics computation to the GPU.
+        Returns True on success, False if no GPU is available.
+        All mutable particle arrays and world constants are transferred to device.
+        """
+        if not gpu_available():
+            return False
+        import cupy as cp
+        self.xp = cp
+        self.gpu_enabled = True
+        self._sync_constants_to_device()
+        self._sync_ball_to_device()
+        return True
+
+    def disable_gpu(self) -> None:
+        """Switch back to CPU (numpy).  Particle arrays are pulled back from device."""
+        if not self.gpu_enabled:
+            return
+        self._sync_ball_to_host()
+        self.xp = np
+        self.gpu_enabled = False
+        # Restore CPU-side world constants — use to_numpy() because bounds are
+        # currently CuPy arrays; np.asarray() cannot implicitly convert them.
+        self.bounds_min   = self._bounds_min_d = to_numpy(self.bounds_min)
+        self.bounds_max   = self._bounds_max_d = to_numpy(self.bounds_max)
+        self.poly_vertices = self._poly_vertices_np
+        self.poly_normal   = self._poly_normal_np
+
+    def _sync_constants_to_device(self) -> None:
+        """Copy immutable world constants to device memory."""
+        xp = self.xp
+        self._bounds_min_d = xp.asarray(self.bounds_min)
+        self._bounds_max_d = xp.asarray(self.bounds_max)
+        self.poly_vertices = xp.asarray(self._poly_vertices_np)
+        self.poly_normal   = xp.asarray(self._poly_normal_np)
+        self.bounds_min    = self._bounds_min_d
+        self.bounds_max    = self._bounds_max_d
+
+    def _sync_ball_to_device(self) -> None:
+        """Transfer all BallState arrays to the active device."""
+        xp = self.xp
+        b = self.ball
+        b.position         = xp.asarray(to_numpy(b.position))
+        b.velocity         = xp.asarray(to_numpy(b.velocity))
+        b.lifespan         = xp.asarray(to_numpy(b.lifespan))
+        b.initial_lifespan = xp.asarray(to_numpy(b.initial_lifespan))
+        b.color            = xp.asarray(to_numpy(b.color))
+
+    def _sync_ball_to_host(self) -> None:
+        """Pull all BallState arrays back to CPU numpy arrays."""
+        b = self.ball
+        b.position         = to_numpy(b.position)
+        b.velocity         = to_numpy(b.velocity)
+        b.lifespan         = to_numpy(b.lifespan)
+        b.initial_lifespan = to_numpy(b.initial_lifespan)
+        b.color            = to_numpy(b.color)
+
+    def notify_particles_respawned(self) -> None:
+        """
+        Call this after reset_particles / spawn_particles when GPU is active
+        so the freshly-created numpy arrays are transferred to the device.
+        """
+        if self.gpu_enabled:
+            self._sync_ball_to_device()
+
+    """functions for computing forces"""
+    def compute_net_force(self):
+        xp = self.xp
+        offset  = self.ball.position
+        gravity = self.ball.mass * xp.asarray(self.config.gravity)
+        wind    = xp.asarray(self.config.wind)
+        force   = gravity + wind - self.config.drag_coefficient * self.ball.velocity
+        if self.config.vortex_enabled:
+            vortex = xp.column_stack((-offset[:, 2], xp.zeros(self.ball.count), offset[:, 0]))
+            force += self.config.vortex_strength * vortex
+        if self.config.explosive_force_enabled:
+            distance  = xp.linalg.norm(offset, axis=1, keepdims=True)
+            safe      = distance > 1.0e-12
+            direction = xp.where(safe, offset / xp.where(safe, distance, 1.0), 0.0)
+            force += self.config.explosive_force_strength * direction
+        return force
+
+    def spawn_particles(self, count, origin=(0.0, 0.0, 0.0)):
+        self.ball.spawn_particles(count, origin)
+
+    """functions for the main simulation loop"""
 
     def step(self, dt: float) -> None:
-        """Advance the simulation using bounded substeps to prevent large restitution effects."""
-        remaining = max(0.0, float(dt))
+        if self.ball.count == 0:
+            return
+        xp = self.xp
+        dt = max(0.0, float(dt))
+        old_position = self.ball.position.copy()
+        self.ball.velocity += self.compute_net_force() / self.ball.mass * dt
+        self.ball.position += self.ball.velocity * dt
+        self._resolve_box_collisions()
+        if self.poly_enabled:
+            self._resolve_polygon_collisions(old_position)
+        self._resolve_mesh_collisions()
+        self.poly_flash_timer = max(0.0, self.poly_flash_timer - dt)
+        if self.mesh is not None:
+            self.mesh.flash_timer = max(0.0, self.mesh.flash_timer - dt)
+        self.ball.lifespan -= dt
+        self.ball.filter_active(self.ball.lifespan > 0.0)
 
-        while remaining > 0.0:
-            substep = min(remaining, MAX_PHYSICS_STEP)
-            self._step_once(substep)
-            self._resolve_ball_collisions()
-            remaining -= substep
+    """functions for resolving collisions"""
 
-    def _step_once(self, dt: float) -> None:
-        """Advance one substep, splitting it at the first box contact."""
-        for ball in self.balls:
-            self._step_ball(ball, dt)
+    def _resolve_box_collisions(self):
+        xp = self.xp
+        lower = self._bounds_min_d + self.ball.radius
+        upper = self._bounds_max_d - self.ball.radius
+        low  = self.ball.position < lower   # (N,3) bool
+        high = self.ball.position > upper   # (N,3) bool
+        self.ball.position = xp.clip(self.ball.position, lower, upper)
+        """check what axis the ball is colliding with and reverse the velocity on that axis, scaled by restitution"""
+        self.ball.velocity = xp.where(low | high,
+                                      -self.config.restitution * self.ball.velocity,
+                                      self.ball.velocity)
 
-    def _step_ball(self, ball: BallState, dt: float) -> None:
-        acceleration = self.compute_net_force(ball) / ball.mass
-        remaining = max(0.0, float(dt))
-        time_epsilon = max(TIME_EPSILON_MIN, remaining * TIME_EPSILON_RELATIVE)
+    """functions for polygon collisions"""
 
-        while remaining > time_epsilon:
-            resting_contact = self._resting_contact(ball, acceleration)
-            if resting_contact is not None:
-                axis, normal = resting_contact
-                limit = self.bounds_min[axis] + ball.radius if normal > 0 else self.bounds_max[axis] - ball.radius
-                ball.position[axis] = limit
-                ball.velocity[:] = 0.0
-                break
+    def _point_inside_polygon(self, points):
+        """polygon info"""
+        xp    = self.xp
+        n     = self.poly_normal
+        verts = self.poly_vertices                    # (nv, 3)
+        nv    = len(self._poly_vertices_np)
+        v0s   = verts                                 # (nv, 3)
+        v1s   = xp.roll(verts, -1, axis=0)           # (nv, 3) — next vertex wrapping around
+        edges = v1s - v0s                             # (nv, 3)
+        """diff for each edge to each point: (nv,N,3)"""
+        diff  = points[None, :, :] - v0s[:, None, :]
+        """cross product of edges and diff: (nv,N,3)"""
+        cross = xp.cross(edges[:, None, :], diff)    # broadcast edges over N
+        """dot product of cross and polygon normal: (nv,N)"""
+        dots  = xp.einsum("ijk,k->ij", cross, n)
+        """if > tolerance for all edges, the point is inside the polygon"""
+        return xp.all(dots >= -2.0e-3, axis=0)
 
-            hit_time, hit_axis, hit_normal = self._first_contact(ball, remaining, time_epsilon)
-            advance = remaining if hit_time is None else hit_time
-            ball.position = ball.position + ball.velocity * advance
-            ball.velocity = ball.velocity + acceleration * advance
-            remaining -= advance
+    def _resolve_polygon_collisions(self, old_position):
+        xp  = self.xp
+        n   = self.poly_normal
+        off = self.poly_plane_offset          # plain Python float is fine here
 
-            if hit_axis is None:
-                break
+        """use the plane equation to compute the signed distance from the polygon plane for each particle"""
+        position = self.ball.position
+        old_distance = old_position @ n - off
+        distance     = position     @ n - off
 
-            limit = self.bounds_min[hit_axis] + ball.radius if hit_normal > 0 else self.bounds_max[hit_axis] - ball.radius
-            ball.position[hit_axis] = limit
-            self._resolve_contact(ball, hit_axis, hit_normal)
+        denom             = old_distance - distance
+        safe              = xp.abs(denom) > 1.0e-12
+        """if the denominator is not zero, compute the fraction of the way from old to new (ex. halfway of the motion)"""
+        crossing_fraction = xp.where(safe, old_distance / xp.where(safe, denom, 1.0), 0.0)
+        """compute the crossing point"""
+        crossing_point      = old_position + crossing_fraction[:, None] * (position - old_position)
+        """and project it onto the polygon plane"""
+        crossing_projection = crossing_point - (crossing_point @ n - off)[:, None] * n
 
-    def _resting_contact(self, ball: BallState, acceleration: np.ndarray):
-        lower = self.bounds_min + ball.radius
-        upper = self.bounds_max - ball.radius
+        """1) the particle crossed the plane"""
+        hit  = (old_distance * distance <= 0.0) & (xp.abs(distance) <= self.ball.radius)
+        """2) the projected point is inside the polygon"""
+        hit &= self._point_inside_polygon(crossing_projection)
+        """3) the particle is moving toward the polygon"""
+        hit &= (self.ball.velocity @ n) < 0.0
 
-        for axis in range(3):
-            for limit, normal in ((lower[axis], 1), (upper[axis], -1)):
-                if abs(ball.position[axis] - limit) > CONTACT_POSITION_EPSILON:
-                    continue
+        """no friction is applied to the tangential velocity; only the normal component is reversed and scaled by restitution"""
+        if xp.any(hit):
+            position[hit] += (self.ball.radius - distance[hit])[:, None] * n
+            normal_speed    = self.ball.velocity[hit] @ n
+            self.ball.velocity[hit] -= (1.0 + self.config.restitution) * normal_speed[:, None] * n
+            self.poly_flash_timer = 0.15
 
-                normal_vector = np.zeros(3, dtype=float)
-                normal_vector[axis] = normal
-                normal_speed = float(np.dot(ball.velocity, normal_vector))
-                tangent_velocity = ball.velocity - normal_speed * normal_vector
-                normal_acceleration = float(np.dot(acceleration, normal_vector))
-                tangent_acceleration = acceleration - normal_acceleration * normal_vector
-                friction_limit = self.config.friction * max(0.0, -normal_acceleration)
+    # ── Point-cloud mesh collision (always runs on CPU) ────────────────────────
 
-                if (
-                    abs(normal_speed) <= REST_VELOCITY_EPSILON
-                    and np.linalg.norm(tangent_velocity) <= REST_VELOCITY_EPSILON
-                    and normal_acceleration < 0.0
-                    and np.linalg.norm(tangent_acceleration) <= friction_limit + REST_VELOCITY_EPSILON
-                ):
-                    return axis, normal
+    def _resolve_mesh_collisions(self) -> None:
+        """
+        Sphere-vs-point(from point-cloud) collision using the spatial hash built at load time.
+        This method always operates on plain NumPy arrays; when GPU mode is active
+        the ball arrays are pulled to host, resolved, then pushed back to device.
+        """
+        mesh = self.mesh
+        if mesh is None or self.ball.count == 0:
+            return
 
-        return None
+        # Pull arrays to CPU for the grid-based loop
+        if self.gpu_enabled:
+            pos_np = to_numpy(self.ball.position)
+            vel_np = to_numpy(self.ball.velocity)
+        else:
+            pos_np = self.ball.position
+            vel_np = self.ball.velocity
 
-    def _first_contact(self, ball: BallState, max_time: float, time_epsilon: float):
-        lower = self.bounds_min + ball.radius
-        upper = self.bounds_max - ball.radius
-        best_time = None
-        best_axis = None
-        best_normal = 0
+        radius      = self.ball.radius
+        contact_eps = 1.0e-3
+        threshold   = radius + contact_eps
+        inv_cell    = 1.0 / GRID_CELL_SIZE
+        grid        = mesh.grid
 
-        """ check in 3 axes if the ball is moving towards a surface and if so, when will it hit the surface"""
-        for axis in range(3):
-            velocity = ball.velocity[axis]
-            # very close to lower surface and moving towards it
-            if velocity < -CONTACT_VELOCITY_EPSILON and ball.position[axis] <= lower[axis] + CONTACT_POSITION_EPSILON:
-                time = 0.0
-                normal = 1
-            # very close to upper surface and moving towards it
-            elif velocity > CONTACT_VELOCITY_EPSILON and ball.position[axis] >= upper[axis] - CONTACT_POSITION_EPSILON:
-                time = 0.0
-                normal = -1
-            # moving to the lower surface now    
-            elif velocity < -CONTACT_VELOCITY_EPSILON and ball.position[axis] > lower[axis]:
-                time = (lower[axis] - ball.position[axis]) / velocity
-                normal = 1
-            # moving to the upper surface now
-            elif velocity > CONTACT_VELOCITY_EPSILON and ball.position[axis] < upper[axis]:
-                time = (upper[axis] - ball.position[axis]) / velocity
-                normal = -1
-            # not moving towards any surface in current axis
-            else:
+        """check if the particle is within the bounding box of the mesh(possible collision)"""
+        lo     = mesh.aabb_min - threshold
+        hi     = mesh.aabb_max + threshold
+        in_box = np.all((pos_np >= lo) & (pos_np <= hi), axis=1)
+        candidates = np.where(in_box)[0]
+
+        any_hit = False
+        for i in candidates:
+            pos = pos_np[i]
+            vel = vel_np[i]
+
+            cx = int(np.floor(pos[0] * inv_cell))
+            cy = int(np.floor(pos[1] * inv_cell))
+            cz = int(np.floor(pos[2] * inv_cell))
+
+            neighbour_chunks = []
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for dz in (-1, 0, 1):
+                        chunk = grid.get((cx + dx, cy + dy, cz + dz))
+                        if chunk is not None:
+                            neighbour_chunks.append(chunk)
+            if not neighbour_chunks:
                 continue
-            # make sure contact happend in best time(either x,y,z)
-            if -time_epsilon <= time <= max_time + time_epsilon and (best_time is None or time < best_time):
-                best_time = max(0.0, time)
-                best_axis = axis
-                best_normal = normal
 
-        return best_time, best_axis, best_normal
+            neighbours = np.concatenate(neighbour_chunks, axis=0)
+            diff       = pos - neighbours
+            dist_sq    = (diff * diff).sum(axis=1)
+            hit_mask   = dist_sq < threshold * threshold
+            if not hit_mask.any():
+                continue
 
-    def _resolve_contact(self, ball: BallState, axis: int, normal: int) -> None:
-        normal_vector = np.zeros(3, dtype=float)
-        normal_vector[axis] = normal
-        normal_speed = float(np.dot(ball.velocity, normal_vector))
+            hit_dist_sq = dist_sq[hit_mask]
+            hit_diff    = diff[hit_mask]
+            closest     = np.argmin(hit_dist_sq)
+            d           = float(np.sqrt(hit_dist_sq[closest]))
 
-        if abs(normal_speed) <= REST_VELOCITY_EPSILON:
-            ball.velocity -= normal_speed * normal_vector
-            return
+            normal = np.array([0.0, 1.0, 0.0]) if d < 1.0e-9 else hit_diff[closest] / d
 
-        if normal_speed >= 0.0:
-            return
-        ball.velocity -= (1.0 + self.config.restitution) * normal_speed * normal_vector
-        tangent = ball.velocity - np.dot(ball.velocity, normal_vector) * normal_vector
-        ball.velocity -= self.config.friction * tangent
+            v_normal = float(np.dot(vel, normal))
+            if v_normal >= 0.0:
+                continue
 
-    def _resolve_ball_collisions(self) -> None:
-        for first_index, first in enumerate(self.balls):
-            for second in self.balls[first_index + 1:]:
-                offset = second.position - first.position
-                distance = float(np.linalg.norm(offset))
-                minimum_distance = first.radius + second.radius
-                if distance >= minimum_distance:
-                    continue
+            penetration    = threshold - d
+            pos_np[i]     += normal * penetration
+            vel_np[i]     -= (1.0 + self.config.restitution) * v_normal * normal
+            v_tan          = vel_np[i] - np.dot(vel_np[i], normal) * normal
+            vel_np[i]     -= self.config.friction * v_tan
+            any_hit        = True
 
-                if distance <= CONTACT_POSITION_EPSILON:
-                    normal = np.array([1.0, 0.0, 0.0])
-                    distance = 0.0
-                else:
-                    normal = offset / distance
-
-                penetration = minimum_distance - distance
-                inverse_mass_sum = 1.0 / first.mass + 1.0 / second.mass
-                first.position -= normal * penetration * (1.0 / first.mass) / inverse_mass_sum
-                second.position += normal * penetration * (1.0 / second.mass) / inverse_mass_sum
-
-                relative_velocity = second.velocity - first.velocity
-                normal_speed = float(np.dot(relative_velocity, normal))
-                if normal_speed >= 0.0:
-                    continue
-
-                impulse_magnitude = -(1.0 + self.config.restitution) * normal_speed / inverse_mass_sum
-                impulse = impulse_magnitude * normal
-                first.velocity -= impulse / first.mass
-                second.velocity += impulse / second.mass
+        # Push results back to device if needed
+        if any_hit:
+            if self.gpu_enabled:
+                xp = self.xp
+                self.ball.position = xp.asarray(pos_np)
+                self.ball.velocity = xp.asarray(vel_np)
+            mesh.flash_timer = 0.12

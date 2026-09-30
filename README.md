@@ -10,6 +10,7 @@ python src/main.py
 
 ## Controls
 - Use the left-side control panel sliders to adjust gravity, x/y wind, air drag, restitution, friction, ball count, and physics timestep while the simulation runs.
+- Use the `VORTEX` and `SPECIAL` buttons to activate the rotational vortex force or an outward radial special force. The same controls are available with `V` and `B`.
 - Use the panel buttons to reset the ball, reset the camera, pause/resume, or select a launch preset.
 - `1`-`4` select repeatable launch cases (side, floor, top, and corner motion)
 - `R` reset the current case

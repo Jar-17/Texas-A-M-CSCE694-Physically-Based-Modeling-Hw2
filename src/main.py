@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import sys
+import os
+import time
 
 import numpy as np
 import pygame
@@ -8,9 +11,13 @@ import pygame
 """include the physics and settings modules"""
 try:
     from physics.world import BallState, PhysicsWorld, SimulationConfig
+    from physics.ply_loader import load_ply, prepare_point_cloud, PointCloudMesh
+    from physics.gpu import gpu_available as _gpu_available, synchronize as _gpu_synchronize, to_numpy
     from ui.settings import AppSettings
 except ModuleNotFoundError:
     from src.physics.world import BallState, PhysicsWorld, SimulationConfig
+    from src.physics.ply_loader import load_ply, prepare_point_cloud, PointCloudMesh
+    from src.physics.gpu import gpu_available as _gpu_available, synchronize as _gpu_synchronize, to_numpy
     from src.ui.settings import AppSettings
 
 WIDTH = 1200
@@ -27,13 +34,16 @@ TEXT = (235, 241, 245)
 MUTED_TEXT = (148, 164, 176)
 ACCENT = (78, 186, 170)
 ACCENT_HOVER = (102, 210, 191)
+POLYGON_FILL = (42, 93, 96)
+MESH_FILL  = (80, 160, 200)   # default point-cloud dot colour
+MESH_FLASH = (255, 255, 255)  # flash colour on collision
 ORIGIN = np.array([0.0, 0.0, 0.0])
 DEFAULT_CAMERA_POSITION = np.array([4.5, 3.2, 6.0], dtype=float)
 MAX_FRAME_DT = 0.25
 MAX_PHYSICS_STEPS_PER_FRAME = 8
 BALL_RADIUS = 0.06
 MIN_BALL_COUNT = 1
-MAX_BALL_COUNT = 12
+MAX_BALL_COUNT = 100000
 
 
 @dataclass
@@ -114,49 +124,133 @@ def draw_box(screen: pygame.Surface, camera: Camera, bounds_min: np.ndarray, bou
             pygame.draw.line(screen, BOX_COLOR, points[first], points[second], 2)
 
 
-def draw_ball(screen: pygame.Surface, camera: Camera, ball: BallState) -> None:
-    projected = camera.project(ball.position)
+def draw_ball(screen: pygame.Surface, camera: Camera, position: np.ndarray, color: np.ndarray, radius: float) -> None:
+    projected = camera.project(position)
     if projected is None:
         return
     (x, y), depth = projected
     _, _, _, viewport_height = VIEWPORT
     focal_length = (viewport_height * 0.5) / np.tan(np.deg2rad(camera.field_of_view) * 0.5)
-    radius = max(2, int(ball.radius * focal_length / depth))
-    pygame.draw.circle(screen, BALL_COLOR, (x, y), radius)
+    pixel_radius = max(2, int(radius * focal_length / depth))
+    pygame.draw.circle(screen, tuple((np.asarray(color) * 255).astype(int)), (x, y), pixel_radius)
 
 
-def reset_ball(ball: BallState, position, velocity) -> None:
-    ball.position = np.array(position, dtype=float)
-    ball.velocity = np.array(velocity, dtype=float)
-    ball.asleep = False
-    ball.sleep_time = 0.0
+def draw_balls_batch(screen: pygame.Surface, camera: Camera, positions_np: np.ndarray, colors_np: np.ndarray, radius: float) -> None:
+    """
+    Batch-render all balls in one vectorised NumPy projection pass.
+
+    * Projects all positions at once (mirrors draw_point_cloud math).
+    * Converts float [0,1] colours to uint8 in a single array operation.
+    * Depth-sorts back-to-front so closer balls occlude farther ones.
+    * Computes per-ball pixel radius vectorised.
+    * Falls back gracefully to an empty draw when no balls are visible.
+    """
+    if len(positions_np) == 0:
+        return
+
+    right, up, forward = camera._basis()
+    cam_pos = camera.position
+
+    offsets = positions_np.astype(np.float64) - cam_pos   # (N, 3)
+    depths  = offsets @ forward                            # (N,)
+
+    # Cull points behind near clip
+    visible = depths > camera.near_clip
+    if not visible.any():
+        return
+
+    v_offsets = offsets[visible]
+    v_depths  = depths[visible]
+    v_colors  = colors_np[visible]
+
+    viewport_x, viewport_y, viewport_w, viewport_h = VIEWPORT
+    focal = (viewport_h * 0.5) / np.tan(np.deg2rad(camera.field_of_view) * 0.5)
+
+    cam_x = v_offsets @ right
+    cam_y = v_offsets @ up
+
+    sx = (viewport_x + viewport_w * 0.5 + focal * cam_x / v_depths).astype(np.int32)
+    sy = (viewport_y + viewport_h * 0.5 - focal * cam_y / v_depths).astype(np.int32)
+
+    # Per-ball pixel radii (vectorised)
+    pixel_radii = np.maximum(2, (radius * focal / v_depths)).astype(np.int32)
+
+    # Float [0,1] → uint8 [0,255] colour conversion in one pass
+    colors_u8 = (np.clip(v_colors, 0.0, 1.0) * 255).astype(np.uint8)
+
+    # Depth-sort back-to-front so closer balls draw on top
+    order = np.argsort(-v_depths)
+
+    draw_circle = pygame.draw.circle
+    for idx in order:
+        draw_circle(
+            screen,
+            (int(colors_u8[idx, 0]), int(colors_u8[idx, 1]), int(colors_u8[idx, 2])),
+            (int(sx[idx]), int(sy[idx])),
+            int(pixel_radii[idx]),
+        )
 
 
-def random_positions(count: int, bounds_min: np.ndarray, bounds_max: np.ndarray, radius: float, rng) -> list[np.ndarray]:
-    positions = []
-    minimum = bounds_min + radius
-    maximum = bounds_max - radius
-    for _ in range(count):
-        for _ in range(1000):
-            candidate = rng.uniform(minimum, maximum)
-            if all(np.linalg.norm(candidate - existing) >= 2.0 * radius for existing in positions):
-                positions.append(candidate)
-                break
-        else:
-            raise RuntimeError("Unable to place all balls without overlap")
-    return positions
+def draw_polygon(screen: pygame.Surface, camera: Camera, vertices: np.ndarray, fill_color=POLYGON_FILL) -> None:
+    projected = [camera.project(vertex) for vertex in vertices]
+    if all(item is not None for item in projected):
+        points = [item[0] for item in projected]
+        pygame.draw.polygon(screen, fill_color, points)
+        pygame.draw.lines(screen, ACCENT_HOVER, True, points, 2)
 
 
-def create_balls(count: int, velocity, bounds_min: np.ndarray, bounds_max: np.ndarray, rng) -> list[BallState]:
-    return [
-        BallState(position=position, velocity=np.array(velocity, dtype=float))
-        for position in random_positions(count, bounds_min, bounds_max, BALL_RADIUS, rng)
-    ]
+def draw_point_cloud(
+    screen: pygame.Surface,
+    camera: Camera,
+    mesh: PointCloudMesh,
+) -> None:
+    """
+    Render the point-cloud mesh as depth-sorted dots.
+
+    Points are projected individually, depth-sorted back-to-front, and drawn
+    as 2-pixel circles.  The colour flashes white immediately after a collision
+    and fades back to MESH_FILL once mesh.flash_timer reaches zero.
+    """
+    pts = mesh.render_points      # (R, 3) float32
+    if len(pts) == 0:
+        return
+
+    # Project all points in one pass, collecting (screen_xy, depth) tuples
+    right, up, forward = camera._basis()
+    cam_pos = camera.position
+
+    offsets = pts.astype(np.float64) - cam_pos          # (R, 3)
+    depths  = offsets @ forward                          # (R,)
+
+    # Cull points behind near clip
+    visible = depths > camera.near_clip
+    if not visible.any():
+        return
+
+    v_offsets = offsets[visible]
+    v_depths  = depths[visible]
+    v_pts     = pts[visible]
+
+    viewport_x, viewport_y, viewport_w, viewport_h = VIEWPORT
+    focal = (viewport_h * 0.5) / np.tan(np.deg2rad(camera.field_of_view) * 0.5)
+
+    cam_x = v_offsets @ right
+    cam_y = v_offsets @ up
+
+    sx = (viewport_x + viewport_w * 0.5 + focal * cam_x / v_depths).astype(np.int32)
+    sy = (viewport_y + viewport_h * 0.5 - focal * cam_y / v_depths).astype(np.int32)
+
+    # Depth sort: farthest first so closer points draw on top
+    order = np.argsort(-v_depths)
+
+    colour = MESH_FLASH if mesh.flash_timer > 0 else MESH_FILL
+    draw_circle = pygame.draw.circle
+    for idx in order:
+        draw_circle(screen, colour, (int(sx[idx]), int(sy[idx])), 2)
 
 
-def reset_balls(balls: list[BallState], velocity, bounds_min: np.ndarray, bounds_max: np.ndarray, rng) -> None:
-    for ball, position in zip(balls, random_positions(len(balls), bounds_min, bounds_max, BALL_RADIUS, rng)):
-        reset_ball(ball, position, velocity)
+def reset_particles(particles: BallState, count: int, origin, rng) -> None:
+    particles.spawn_particles(count, origin, rng)
 
 
 @dataclass
@@ -208,7 +302,13 @@ def draw_panel(
     small_font: pygame.font.Font,
     sliders: list[Slider],
     paused: bool,
+    vortex_enabled: bool,
+    explosive_force_enabled: bool,
+    poly_enabled: bool,
     mouse_position: tuple[int, int],
+    mesh_name: str | None = None,
+    gpu_enabled: bool = False,
+    gpu_available: bool = False,
 ) -> None:
     pygame.draw.rect(screen, PANEL_BG, (0, 0, PANEL_WIDTH, HEIGHT))
     pygame.draw.line(screen, PANEL_BORDER, (PANEL_WIDTH - 1, 0), (PANEL_WIDTH - 1, HEIGHT), 2)
@@ -217,7 +317,30 @@ def draw_panel(
     for slider in sliders:
         slider.draw(screen, font, small_font)
 
-    button_y = 520
+    # Four toggle buttons on one row: VORTEX | EXPLODE | POLY | GPU
+    force_y = 485
+    btn_w = 59
+    gpu_label = "GPU"
+    gpu_color_override: tuple | None = None
+    if not gpu_available:
+        gpu_color_override = (70, 70, 70)   # greyed-out when no CUDA device found
+    force_buttons: list[tuple] = [
+        (pygame.Rect(22,                        force_y, btn_w, 28), "VORTEX",  vortex_enabled,           None),
+        (pygame.Rect(22 + (btn_w + 6),          force_y, btn_w, 28), "EXPLODE", explosive_force_enabled,   None),
+        (pygame.Rect(22 + (btn_w + 6) * 2,      force_y, btn_w, 28), "POLY",    poly_enabled,              None),
+        (pygame.Rect(22 + (btn_w + 6) * 3,      force_y, btn_w, 28), gpu_label, gpu_enabled,               gpu_color_override),
+    ]
+    for rect, label, enabled, color_override in force_buttons:
+        hovered = rect.collidepoint(mouse_position)
+        if color_override is not None:
+            # Draw greyed-out button for unavailable GPU
+            pygame.draw.rect(screen, color_override, rect, border_radius=5)
+            text_surf = small_font.render(f"{label}: {'ON' if enabled else 'OFF'}", True, (140, 140, 140))
+            screen.blit(text_surf, text_surf.get_rect(center=rect.center))
+        else:
+            draw_button(screen, small_font, rect, f"{label}: {'ON' if enabled else 'OFF'}", hovered)
+
+    button_y = 530
     buttons = (
         (pygame.Rect(22, button_y, 122, 38), "RESET BALL"),
         (pygame.Rect(154, button_y, 122, 38), "RESET VIEW"),
@@ -226,13 +349,101 @@ def draw_panel(
     for rect, label in buttons:
         draw_button(screen, small_font, rect, label, rect.collidepoint(mouse_position))
 
+    # ---- PLY mesh load / clear ------------------------------------------
+    mesh_y = 624
+    draw_button(screen, small_font, pygame.Rect(22, mesh_y, 122, 30), "LOAD MESH",
+                pygame.Rect(22, mesh_y, 122, 30).collidepoint(mouse_position))
+    draw_button(screen, small_font, pygame.Rect(154, mesh_y, 122, 30), "CLEAR MESH",
+                pygame.Rect(154, mesh_y, 122, 30).collidepoint(mouse_position))
+    if mesh_name:
+        name_surf = small_font.render(f"Mesh: {mesh_name}", True, ACCENT)
+    else:
+        name_surf = small_font.render("No mesh loaded", True, MUTED_TEXT)
+    screen.blit(name_surf, (22, mesh_y + 34))
+
     launch_label = small_font.render("Launch presets", True, MUTED_TEXT)
-    screen.blit(launch_label, (WIDTH - launch_label.get_width() - 22, 625))
+    screen.blit(launch_label, (WIDTH - launch_label.get_width() - 22, 672))
     for index, label in enumerate(("SIDE", "FLOOR", "TOP", "CORNER")):
-        rect = pygame.Rect(22 + index * 64, 648, 56, 32)
+        rect = pygame.Rect(22 + index * 64, 690, 56, 32)
         draw_button(screen, small_font, rect, label, rect.collidepoint(mouse_position))
     keyboard_label = small_font.render("Keyboard: A/D orbit  W/S tilt  Q/E zoom  ESC quit", True, MUTED_TEXT)
-    screen.blit(keyboard_label, (WIDTH - keyboard_label.get_width() - 22, 710))
+    screen.blit(keyboard_label, (WIDTH - keyboard_label.get_width() - 22, 730))
+
+
+def update_perf(perf: dict, key: str, sample: float, smoothing: float = 0.1) -> None:
+    """Exponential moving average so the on-screen numbers stay readable."""
+    perf[key] += (sample - perf[key]) * smoothing
+
+
+def draw_perf_stats(
+    screen: pygame.Surface,
+    font: pygame.font.Font,
+    perf: dict,
+    gpu_enabled: bool,
+    ball_count: int,
+    paused: bool,
+) -> None:
+    """
+    Top-right readout comparing CPU and GPU mode:
+      * physics ms  - time spent in world.step() this frame (the part the GPU accelerates)
+      * draw ms     - time spent rendering (always CPU, same in both modes)
+      * sim speed   - simulated time / real time; below 100% the step cap is
+                      dropping time, which is what makes motion look choppy
+    """
+    sim_speed = perf["sim_speed"] * 100.0
+    if paused:
+        speed_text, speed_color = "sim speed   paused", MUTED_TEXT
+    else:
+        speed_text = f"sim speed   {sim_speed:5.0f} %"
+        speed_color = ACCENT_HOVER if sim_speed >= 95.0 else (255, 200, 90) if sim_speed >= 60.0 else (255, 110, 100)
+    lines = [
+        (f"{'GPU' if gpu_enabled else 'CPU'} mode   {ball_count} balls", TEXT),
+        (f"physics   {perf['physics_ms']:6.1f} ms  ({perf['steps']:.1f} steps)", ACCENT_HOVER),
+        (f"draw      {perf['draw_ms']:6.1f} ms", MUTED_TEXT),
+        (speed_text, speed_color),
+    ]
+    y = 56
+    for text, color in lines:
+        surface = font.render(text, True, color)
+        screen.blit(surface, (WIDTH - surface.get_width() - 22, y))
+        y += surface.get_height() + 2
+
+def open_and_load_ply(world: PhysicsWorld) -> str | None:
+    """
+    Open a file-picker dialog (tkinter), load the chosen .ply file,
+    build a PointCloudMesh, attach it to world.mesh, and return the
+    stem name for the status display.  Returns None on cancel / error.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()          # hide the empty Tk window
+        root.attributes("-topmost", True)
+        path = filedialog.askopenfilename(
+            title="Load PLY point cloud",
+            filetypes=[("PLY files", "*.ply"), ("All files", "*.*")],
+        )
+        root.destroy()
+        if not path:
+            return None
+        raw_xyz = load_ply(path)
+        # Bounds are CuPy arrays in GPU mode; the loader works on NumPy only.
+        mesh = prepare_point_cloud(raw_xyz, to_numpy(world.bounds_min), to_numpy(world.bounds_max))
+        mesh.name = os.path.splitext(os.path.basename(path))[0]
+        world.mesh = mesh
+        return mesh.name
+    except Exception as exc:
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("PLY load error", str(exc))
+            root.destroy()
+        except Exception:
+            pass
+        return None
 
 
 def main() -> int:
@@ -267,11 +478,11 @@ def main() -> int:
     bounds_min = np.array([-1.5, -1.0, -1.2], dtype=float)
     bounds_max = np.array([1.5, 1.0, 1.2], dtype=float)
     rng = np.random.default_rng()
-    balls = create_balls(3, initial_velocity, bounds_min, bounds_max, rng)
-    ball = balls[0]
+    particles = BallState()
+    particles.spawn_particles(3, initial_position, rng)
+    particles.velocity[:] = np.asarray(initial_velocity, dtype=float)
     world = PhysicsWorld(
-        ball=ball,
-        balls=balls,
+        ball=particles,
         config=SimulationConfig(
             gravity=settings.gravity_vector(),
             wind=settings.wind_vector(),
@@ -287,9 +498,15 @@ def main() -> int:
     accumulator = 0.0
     running = True
     paused = False
+    particle_count_setting = 3
+    mesh_name: str | None = None
+    poly_enabled = True
+    # Smoothed performance stats shown in the viewport (see draw_perf_stats).
+    perf = {"physics_ms": 0.0, "draw_ms": 0.0, "steps": 0.0, "sim_speed": 1.0}
     while running:
         """rendering at 60 fps and physics at fixed dt"""
-        frame_dt = min(clock.tick(60) / 1000.0, MAX_FRAME_DT)
+        real_dt = clock.tick(60) / 1000.0
+        frame_dt = min(real_dt, MAX_FRAME_DT)
         if not paused:
             accumulator += frame_dt
 
@@ -300,31 +517,63 @@ def main() -> int:
                 running = False
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 mouse_position = event.pos
-                reset_button = pygame.Rect(22, 520, 122, 38)
-                view_button = pygame.Rect(154, 520, 122, 38)
-                pause_button = pygame.Rect(22, 568, 254, 40)
-                if reset_button.collidepoint(mouse_position):
-                    reset_balls(balls, initial_velocity, bounds_min, bounds_max, rng)
+                vortex_button   = pygame.Rect(22,       485, 59, 28)
+                explode_button  = pygame.Rect(87,       485, 59, 28)
+                poly_button     = pygame.Rect(152,      485, 59, 28)
+                gpu_button      = pygame.Rect(217,      485, 59, 28)
+                reset_button    = pygame.Rect(22, 530, 122, 38)
+                view_button     = pygame.Rect(154, 530, 122, 38)
+                pause_button    = pygame.Rect(22, 578, 254, 40)
+                load_mesh_button  = pygame.Rect(22, 624, 122, 30)
+                clear_mesh_button = pygame.Rect(154, 624, 122, 30)
+                if vortex_button.collidepoint(mouse_position):
+                    settings.vortex_enabled = not settings.vortex_enabled
+                elif explode_button.collidepoint(mouse_position):
+                    settings.explosive_force_enabled = not settings.explosive_force_enabled
+                elif poly_button.collidepoint(mouse_position):
+                    poly_enabled = not poly_enabled
+                elif gpu_button.collidepoint(mouse_position):
+                    if _gpu_available():
+                        settings.gpu_enabled = not settings.gpu_enabled
+                        if settings.gpu_enabled:
+                            world.enable_gpu()
+                        else:
+                            world.disable_gpu()
+                elif reset_button.collidepoint(mouse_position):
+                    reset_particles(particles, 3, initial_position, rng)
+                    world.notify_particles_respawned()
                 elif view_button.collidepoint(mouse_position):
                     camera.reset()
                 elif pause_button.collidepoint(mouse_position):
                     paused = not paused
+                elif load_mesh_button.collidepoint(mouse_position):
+                    loaded = open_and_load_ply(world)
+                    if loaded is not None:
+                        mesh_name = loaded
+                        poly_enabled = False        # hide polygon while mesh is active
+                        world.poly_enabled = False
+                elif clear_mesh_button.collidepoint(mouse_position):
+                    world.mesh = None
+                    mesh_name = None
+                    poly_enabled = True             # restore polygon when mesh is removed
+                    world.poly_enabled = True
                 else:
                     for index in range(4):
-                        preset_button = pygame.Rect(22 + index * 64, 648, 56, 32)
+                        preset_button = pygame.Rect(22 + index * 64, 690, 56, 32)
                         if preset_button.collidepoint(mouse_position):
                             preset_key = (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4)[index]
                             initial_position, initial_velocity = presets[preset_key]
-                            reset_balls(balls, initial_velocity, bounds_min, bounds_max, rng)
+                            reset_particles(particles, 3, initial_position, rng)
+                            world.notify_particles_respawned()
                             break
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False
                 elif event.key == pygame.K_r:
-                    reset_balls(balls, initial_velocity, bounds_min, bounds_max, rng)
+                    reset_particles(particles, 3, initial_position, rng)
                 elif event.key in presets:
                     initial_position, initial_velocity = presets[event.key]
-                    reset_balls(balls, initial_velocity, bounds_min, bounds_max, rng)
+                    reset_particles(particles, 3, initial_position, rng)
                 elif event.key == pygame.K_SPACE:
                     paused = not paused
                 elif event.key in (pygame.K_LEFT, pygame.K_RIGHT):
@@ -347,6 +596,12 @@ def main() -> int:
                     sliders[3].value = settings.drag_coefficient
                 elif event.key == pygame.K_c:
                     camera.reset()
+                elif event.key == pygame.K_v:
+                    settings.vortex_enabled = not settings.vortex_enabled
+                elif event.key == pygame.K_b:
+                    settings.explosive_force_enabled = not settings.explosive_force_enabled
+                elif event.key == pygame.K_p:
+                    poly_enabled = not poly_enabled
 
         settings.gravity = sliders[0].value
         settings.wind_x = sliders[1].value
@@ -355,10 +610,10 @@ def main() -> int:
         settings.restitution = sliders[4].value
         settings.friction = sliders[5].value
         desired_ball_count = int(round(sliders[6].value))
-        if desired_ball_count != len(balls):
-            balls = create_balls(desired_ball_count, initial_velocity, bounds_min, bounds_max, rng)
-            world.balls = balls
-            world.ball = balls[0]
+        if desired_ball_count != particle_count_setting:
+            reset_particles(particles, desired_ball_count, initial_position, rng)
+            world.notify_particles_respawned()
+            particle_count_setting = desired_ball_count
         if settings.fixed_dt != sliders[7].value:
             settings.fixed_dt = sliders[7].value
 
@@ -375,25 +630,57 @@ def main() -> int:
         world.config.restitution = settings.restitution
         world.config.friction = settings.friction
         world.config.time_step = settings.fixed_dt
+        world.config.vortex_enabled = settings.vortex_enabled
+        world.config.explosive_force_enabled = settings.explosive_force_enabled
+        world.poly_enabled = poly_enabled
 
         if not paused:
+            physics_start = time.perf_counter()
             physics_steps = 0
             while accumulator >= settings.fixed_dt and physics_steps < MAX_PHYSICS_STEPS_PER_FRAME:
                 world.step(settings.fixed_dt)
                 accumulator -= settings.fixed_dt
                 physics_steps += 1
+            if world.gpu_enabled:
+                # CuPy runs asynchronously; wait so the timing covers the real GPU work.
+                _gpu_synchronize()
+            update_perf(perf, "physics_ms", (time.perf_counter() - physics_start) * 1000.0)
+            update_perf(perf, "steps", physics_steps)
+            if real_dt > 0.0:
+                update_perf(perf, "sim_speed", physics_steps * settings.fixed_dt / real_dt)
             if physics_steps == MAX_PHYSICS_STEPS_PER_FRAME:
                 # Drop excessive backlog instead of allowing a spiral of death.
                 accumulator = 0.0
 
+        draw_start = time.perf_counter()
         screen.fill(BG)
-        draw_box(screen, camera, world.bounds_min, world.bounds_max)
-        for ball in balls:
-            draw_ball(screen, camera, ball)
+        draw_box(screen, camera, to_numpy(world.bounds_min), to_numpy(world.bounds_max))
+        if world.mesh is not None:
+            draw_point_cloud(screen, camera, world.mesh)
+        draw_balls_batch(screen, camera, to_numpy(particles.position), to_numpy(particles.color), particles.radius)
+        if poly_enabled:
+            draw_polygon(screen, camera, to_numpy(world.poly_vertices),
+                         fill_color=(255, 255, 255) if world.poly_flash_timer > 0 else POLYGON_FILL)
+        update_perf(perf, "draw_ms", (time.perf_counter() - draw_start) * 1000.0)
         mouse_position = pygame.mouse.get_pos()
-        draw_panel(screen, font, small_font, sliders, paused, mouse_position)
-        status = f"{'PAUSED' if paused else 'RUNNING'}   |   camera distance {camera.distance:.2f}   |   SPACE pause"
+        draw_panel(
+            screen,
+            font,
+            small_font,
+            sliders,
+            paused,
+            settings.vortex_enabled,
+            settings.explosive_force_enabled,
+            poly_enabled,
+            mouse_position,
+            mesh_name=mesh_name,
+            gpu_enabled=settings.gpu_enabled,
+            gpu_available=_gpu_available(),
+        )
+        mesh_info = f"  |   mesh: {mesh_name}" if mesh_name else ""
+        status = f"{'PAUSED' if paused else 'RUNNING'}   |   camera distance {camera.distance:.2f}   |   SPACE pause{mesh_info}"
         screen.blit(font.render(status, True, TEXT), (PANEL_WIDTH + 22, 20))
+        draw_perf_stats(screen, small_font, perf, world.gpu_enabled, particles.count, paused)
 
         pygame.display.flip()
 
@@ -402,4 +689,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # If run with a '--test' flag, execute tests instead of launching the Pygame UI
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        import sys
+        sys.exit(0)
+    else:
+        raise SystemExit(main())
+    
